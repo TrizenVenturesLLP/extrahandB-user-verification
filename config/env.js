@@ -14,16 +14,35 @@ const envSchema = z.object({
   // Service Authentication (for inter-service communication)
   SERVICE_AUTH_TOKEN: z.string().min(1, 'SERVICE_AUTH_TOKEN is required'),
   
-  // Cashfree Configuration
+  // ===== PROVIDER SELECTION =====
+  VERIFICATION_PROVIDER: z.enum(['cashfree', 'signzy', 'karza']).default('cashfree'),
+  
+  // ===== CASHFREE CONFIGURATION (ACTIVE) =====
   CASHFREE_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
   CASHFREE_CLIENT_ID: z.string().min(1, 'CASHFREE_CLIENT_ID is required'),
   CASHFREE_CLIENT_SECRET: z.string().min(1, 'CASHFREE_CLIENT_SECRET is required'),
   CASHFREE_TEST_OTP: z.string().default('111000'),
   
   // Cashfree URLs (auto-set based on environment)
-  // Secure ID APIs base URL - endpoint is /verification/offline-aadhaar/otp
   CASHFREE_SANDBOX_URL: z.string().url().default('https://sandbox.cashfree.com/verification'),
   CASHFREE_PRODUCTION_URL: z.string().url().default('https://api.cashfree.com/verification'),
+  
+  // ===== SIGNZY CONFIGURATION (FUTURE - OPTIONAL) =====
+  SIGNZY_API_KEY: z.string().optional(),
+  SIGNZY_API_SECRET: z.string().optional(),
+  SIGNZY_BASE_URL: z.string().url().optional(),
+  
+  // ===== KARZA CONFIGURATION (FUTURE - OPTIONAL) =====
+  KARZA_API_KEY: z.string().optional(),
+  KARZA_API_SECRET: z.string().optional(),
+  KARZA_BASE_URL: z.string().url().optional(),
+  
+  // ===== FEATURE FLAGS =====
+  FEATURE_AADHAAR: z.string().default('true'),
+  FEATURE_PAN: z.string().default('false'),
+  FEATURE_BANK: z.string().default('false'),
+  FEATURE_FACE: z.string().default('false'),
+  FEATURE_LIVENESS: z.string().default('false'),
   
   // Main Backend URL (for callbacks if needed)
   MAIN_BACKEND_URL: z.string().url().optional(),
@@ -118,9 +137,16 @@ function validateEnv() {
     console.log('✅ Environment validation successful');
     console.log(`   Environment: ${env.NODE_ENV}`);
     console.log(`   Port: ${env.PORT}`);
+    console.log(`   Verification Provider: ${env.VERIFICATION_PROVIDER}`);
     console.log(`   Cashfree Environment: ${env.CASHFREE_ENV}`);
     console.log(`   Cashfree Base URL: ${getCashfreeBaseUrl(env)}`);
     console.log(`   MongoDB: ${env.MONGODB_URI ? 'Configured' : 'Not configured (in-memory fallback)'}`);
+    console.log('   Feature Flags:');
+    console.log(`     - Aadhaar: ${env.FEATURE_AADHAAR === 'true' ? '✅ ENABLED' : '🔒 DISABLED'}`);
+    console.log(`     - PAN: ${env.FEATURE_PAN === 'true' ? '✅ ENABLED' : '🔒 DISABLED (ready)'}`);
+    console.log(`     - Bank: ${env.FEATURE_BANK === 'true' ? '✅ ENABLED' : '🔒 DISABLED (ready)'}`);
+    console.log(`     - Face: ${env.FEATURE_FACE === 'true' ? '✅ ENABLED' : '🔒 DISABLED (ready)'}`);
+    console.log(`     - Liveness: ${env.FEATURE_LIVENESS === 'true' ? '✅ ENABLED' : '🔒 DISABLED (ready)'}`);
     
     return {
       ...env,

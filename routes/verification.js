@@ -2,19 +2,65 @@ const express = require('express');
 const router = express.Router();
 const Verification = require('../models/Verification');
 const cashfreeService = require('../services/cashfreeService');
+const { getVerificationProvider } = require('../services/providerFactory');
 const { serviceAuthMiddleware } = require('../middleware/auth');
+const { otpGenerationLimiter, otpResendLimiter, otpVerificationLimiter } = require('../middleware/rateLimiting');
 const { isValidAadhaarFormat, cleanAadhaarNumber, isValidOtpFormat, maskAadhaar } = require('../utils/validation');
 const { successResponse, errorResponse, getClientIp } = require('../utils/helpers');
 const logger = require('../config/logger');
 
+// =====================================================
+// FEATURE FLAGS
+// =====================================================
+const FEATURES = {
+  AADHAAR: process.env.FEATURE_AADHAAR !== 'false', // ✅ ENABLED by default
+  PAN: process.env.FEATURE_PAN === 'true',          // 🔒 DISABLED (ready to enable)
+  BANK: process.env.FEATURE_BANK === 'true',        // 🔒 DISABLED (ready to enable)
+  FACE: process.env.FEATURE_FACE === 'true',        // 🔒 DISABLED (ready to enable)
+  LIVENESS: process.env.FEATURE_LIVENESS === 'true', // 🔒 DISABLED (ready to enable)
+};
+
+logger.info('🎌 Feature flags initialized', FEATURES);
+
+// =====================================================
+// FEATURE AVAILABILITY ENDPOINT
+// =====================================================
+
+/**
+ * GET /api/v1/verification/features
+ * Return which features are currently enabled
+ */
+router.get('/features', (req, res) => {
+  res.json({
+    success: true,
+    features: FEATURES,
+    message: 'Available verification features',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// =====================================================
+// AADHAAR VERIFICATION ROUTES (ACTIVE)
+// =====================================================
+
 /**
  * POST /api/v1/verification/aadhaar/initiate
  * Initiate Aadhaar KYC - Generate OTP
+ * Rate limited: 3 requests per user per hour
  */
-router.post('/aadhaar/initiate', serviceAuthMiddleware, async (req, res) => {
+router.post('/aadhaar/initiate', serviceAuthMiddleware, otpGenerationLimiter, async (req, res) => {
   try {
+    // Feature flag check
+    if (!FEATURES.AADHAAR) {
+      return res.status(503).json(errorResponse(
+        'Aadhaar verification is temporarily disabled',
+        'This feature is currently unavailable',
+        'FEATURE_DISABLED'
+      ));
+    }
+
     const userId = req.headers['x-user-id'] || req.body.userId;
-    const { aadhaarNumber, consentGiven } = req.body;
+    const { aadhaarNumber, consentGiven, consent } = req.body;
 
     // Validation
     if (!userId) {
@@ -75,19 +121,48 @@ router.post('/aadhaar/initiate', serviceAuthMiddleware, async (req, res) => {
     }
 
     // Save verification record
+    const now = new Date();
+    const otpExpiresAt = new Date(now.getTime() + 10 * 60 * 1000); // OTP expires in 10 minutes
+    
+    // Enhanced consent object (backward compatible)
+    const consentData = consent || {
+      given: consentGiven === true,
+      text: 'User agreed to Aadhaar verification',
+      version: 'v1.0'
+    };
+    
     const verificationData = {
       userId,
       type: 'aadhaar',
       status: 'otp_sent',
-      provider: 'cashfree',
+      provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
       transactionId: otpResult.refId,
       refId: otpResult.refId,
       maskedAadhaar: maskAadhaar(cleanedAadhaar),
       otpSent: true,
-      otpSentAt: new Date(),
-      consentGiven: true,
-      consentGivenAt: new Date(),
-      initiatedAt: new Date(),
+      otpSentAt: now,
+      otpExpiresAt: otpExpiresAt,
+      // Enhanced consent tracking
+      consent: {
+        given: true,
+        givenAt: now,
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        consentVersion: consentData.version || 'v1.0',
+        consentText: consentData.text || 'User agreed to Aadhaar verification'
+      },
+      // Audit log
+      auditLog: [{
+        action: 'initiated',
+        performedBy: userId,
+        performedAt: now,
+        ipAddress: getClientIp(req),
+        metadata: {
+          provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+          environment: process.env.CASHFREE_ENV || 'sandbox'
+        }
+      }],
+      initiatedAt: now,
       metadata: {
         ipAddress: getClientIp(req),
         userAgent: req.get('user-agent') || 'unknown',
@@ -140,8 +215,9 @@ router.post('/aadhaar/initiate', serviceAuthMiddleware, async (req, res) => {
 /**
  * POST /api/v1/verification/aadhaar/verify
  * Verify Aadhaar OTP
+ * Rate limited: 10 attempts per user per 15 minutes
  */
-router.post('/aadhaar/verify', serviceAuthMiddleware, async (req, res) => {
+router.post('/aadhaar/verify', serviceAuthMiddleware, otpVerificationLimiter, async (req, res) => {
   try {
     const userId = req.headers['x-user-id'] || req.body.userId;
     const { transactionId, refId, otp } = req.body;
@@ -203,6 +279,16 @@ router.post('/aadhaar/verify', serviceAuthMiddleware, async (req, res) => {
       return res.status(400).json(errorResponse(
         'OTP not sent for this verification',
         `Verification status is: ${verification.status}`
+      ));
+    }
+
+    // Check if OTP has expired
+    if (verification.isOtpExpired()) {
+      logger.warn('⚠️ OTP has expired', { userId, refId: verificationRefId });
+      return res.status(400).json(errorResponse(
+        'OTP has expired',
+        'The OTP has expired. Please request a new one.',
+        'OTP_EXPIRED'
       ));
     }
 
@@ -292,6 +378,125 @@ router.post('/aadhaar/verify', serviceAuthMiddleware, async (req, res) => {
 });
 
 /**
+ * POST /api/v1/verification/aadhaar/resend
+ * Resend OTP for Aadhaar verification
+ * Rate limited: 5 requests per user per hour
+ */
+router.post('/aadhaar/resend', serviceAuthMiddleware, otpResendLimiter, async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || req.body.userId;
+    const { refId } = req.body;
+
+    // Validation
+    if (!userId) {
+      return res.status(400).json(errorResponse(
+        'Missing required field: userId',
+        'User ID is required'
+      ));
+    }
+
+    logger.info('🔄 Resending Aadhaar OTP', {
+      userId,
+      refId,
+      ip: getClientIp(req)
+    });
+
+    // Get existing verification record
+    let verification;
+    if (refId) {
+      verification = await Verification.findOne({ 
+        userId,
+        $or: [
+          { refId: refId },
+          { transactionId: refId }
+        ]
+      });
+    } else {
+      verification = await Verification.findByUserId(userId);
+    }
+
+    if (!verification) {
+      logger.warn('⚠️ No verification record found for user', { userId });
+      return res.status(404).json(errorResponse(
+        'No verification found',
+        'Please initiate verification first'
+      ));
+    }
+
+    if (verification.status === 'verified') {
+      return res.status(400).json(errorResponse(
+        'Already verified',
+        'This user is already verified'
+      ));
+    }
+
+    // Check if OTP was sent recently (cooldown: 60 seconds)
+    if (verification.otpSentAt) {
+      const timeSinceLastOTP = Date.now() - new Date(verification.otpSentAt).getTime();
+      if (timeSinceLastOTP < 60000) { // 60 seconds
+        const remainingSeconds = Math.ceil((60000 - timeSinceLastOTP) / 1000);
+        return res.status(429).json(errorResponse(
+          'Please wait before requesting another OTP',
+          `You can request a new OTP after ${remainingSeconds} seconds`,
+          'RESEND_COOLDOWN'
+        ));
+      }
+    }
+
+    // Resend OTP via Cashfree
+    const otpResult = await cashfreeService.resendAadhaarOTP(verification.refId);
+
+    if (!otpResult.success) {
+      return res.status(400).json(errorResponse(
+        otpResult.message || 'Failed to resend OTP',
+        'Could not resend OTP'
+      ));
+    }
+
+    // Update verification record
+    const now = new Date();
+    const otpExpiresAt = new Date(now.getTime() + 10 * 60 * 1000); // OTP expires in 10 minutes
+    
+    verification.otpSentAt = now;
+    verification.otpExpiresAt = otpExpiresAt;
+    verification.otpAttempts = 0; // Reset attempts on resend
+    verification.status = 'otp_sent';
+    verification.refId = otpResult.refId; // Update refId if it changed
+    await verification.save();
+
+    logger.info('✅ Aadhaar OTP resent successfully', {
+      userId,
+      refId: otpResult.refId
+    });
+
+    const response = successResponse({
+      refId: otpResult.refId,
+      maskedAadhaar: verification.maskedAadhaar,
+      message: otpResult.message || 'OTP resent successfully'
+    }, 'OTP resent successfully');
+
+    // In sandbox, include test OTP for testing convenience
+    if (cashfreeService.isSandbox()) {
+      response.data.testOtp = cashfreeService.getTestOtp();
+      response.data.message = 'OTP resent successfully (Sandbox mode - use test OTP for testing)';
+    }
+
+    res.json(response);
+  } catch (error) {
+    logger.error('❌ Error resending OTP', {
+      error: error.message,
+      stack: error.stack,
+      userId: req.headers['x-user-id'] || req.body.userId
+    });
+
+    res.status(500).json(errorResponse(
+      error.message || 'Failed to resend OTP',
+      'An error occurred while resending OTP'
+    ));
+  }
+});
+
+/**
  * GET /api/v1/verification/status/:userId
  * Get verification status for a user
  */
@@ -366,6 +571,471 @@ router.get('/badge/:userId', serviceAuthMiddleware, async (req, res) => {
     res.status(500).json(errorResponse(
       error.message || 'Failed to fetch verification badge',
       'An error occurred while fetching verification badge'
+    ));
+  }
+});
+
+// =====================================================
+// FUTURE VERIFICATION ROUTES (READY - FEATURE FLAGGED)
+// =====================================================
+
+/**
+ * POST /api/v1/verification/pan/verify
+ * Verify PAN card - STUB (Ready to activate)
+ * 
+ * TO ACTIVATE:
+ * 1. Set FEATURE_PAN=true in .env
+ * 2. Ensure provider supports PAN (Cashfree does!)
+ * 3. Uncomment implementation below
+ * 4. Restart service
+ */
+router.post('/pan/verify', serviceAuthMiddleware, async (req, res) => {
+  if (!FEATURES.PAN) {
+    return res.status(503).json({
+      success: false,
+      message: 'PAN verification is not yet available. Contact admin to enable this feature.',
+      code: 'FEATURE_NOT_ENABLED',
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // ✅ PAN VERIFICATION - ACTIVE
+  try {
+    const userId = req.headers['x-user-id'] || req.body.userId;
+    const { panNumber, consent } = req.body;
+
+    if (!userId) {
+      return res.status(400).json(errorResponse('Missing required field: userId', 'User ID is required'));
+    }
+
+    if (!panNumber) {
+      return res.status(400).json(errorResponse('Missing required field: panNumber', 'PAN number is required'));
+    }
+
+    if (!consent?.given) {
+      return res.status(400).json(errorResponse('Consent required', 'User consent is required for PAN verification'));
+    }
+
+    // Validate PAN format
+    if (!/^[A-Z]{5}[0-9]{4}[A-Z]{1}$/.test(panNumber)) {
+      return res.status(400).json(errorResponse('Invalid PAN format', 'PAN must be in format: ABCDE1234F'));
+    }
+
+    logger.info('🔄 Verifying PAN', { userId, maskedPAN: panNumber.substring(0, 2) + 'XXX' + panNumber.slice(-4) });
+
+    // Get verification provider
+    const provider = getVerificationProvider(process.env);
+    
+    // Call provider to verify PAN
+    const result = await provider.verifyPAN(panNumber);
+
+    // Create verification record
+    const now = new Date();
+    const verification = await Verification.create({
+      userId,
+      type: 'pan',
+      status: result.success ? 'verified' : 'failed',
+      provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+      maskedPAN: result.data?.maskedPAN || (panNumber.substring(0, 2) + 'XXX' + panNumber.slice(-4)),
+      verifiedData: { 
+        name: result.data?.name,
+        panNumber: result.data?.panNumber,
+        status: result.data?.status
+      },
+      consent: {
+        given: true,
+        givenAt: now,
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        consentVersion: consent.version || 'v1.0',
+        consentText: consent.text || 'User consented to PAN verification'
+      },
+      auditLog: [{
+        action: 'verified',
+        performedBy: userId,
+        performedAt: now,
+        ipAddress: getClientIp(req),
+        metadata: {
+          provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+          environment: process.env.CASHFREE_ENV || 'sandbox'
+        }
+      }],
+      verifiedAt: result.success ? now : null,
+      failedAt: result.success ? null : now,
+      failureReason: result.success ? null : result.message,
+      metadata: {
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        environment: process.env.CASHFREE_ENV || 'sandbox'
+      }
+    });
+
+    logger.info('✅ PAN verification completed', { 
+      userId, 
+      verificationId: verification._id,
+      status: verification.status 
+    });
+
+    res.json(successResponse({
+      verificationId: verification._id,
+      maskedPAN: verification.maskedPAN,
+      verifiedData: {
+        name: verification.verifiedData?.name
+      },
+      status: verification.status
+    }, 'PAN verified successfully'));
+
+  } catch (error) {
+    logger.error('❌ PAN verification error', { 
+      userId: req.headers['x-user-id'],
+      error: error.message,
+      stack: error.stack
+    });
+    
+    res.status(500).json(errorResponse(
+      error.message || 'Failed to verify PAN',
+      'An error occurred while verifying PAN'
+    ));
+  }
+});
+
+/**
+ * POST /api/v1/verification/bank/verify
+ * Verify bank account
+ */
+router.post('/bank/verify', serviceAuthMiddleware, async (req, res) => {
+  if (!FEATURES.BANK) {
+    return res.status(503).json({
+      success: false,
+      message: 'Bank account verification is not yet available. Contact admin to enable this feature.',
+      code: 'FEATURE_NOT_ENABLED',
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // ✅ BANK VERIFICATION - ACTIVE
+  try {
+    const userId = req.headers['x-user-id'] || req.body.userId;
+    const { accountNumber, ifsc, accountHolderName, consent } = req.body;
+
+    if (!userId) {
+      return res.status(400).json(errorResponse('Missing required field: userId', 'User ID is required'));
+    }
+
+    if (!accountNumber || !ifsc) {
+      return res.status(400).json(errorResponse('Missing required fields', 'Account number and IFSC are required'));
+    }
+
+    if (!consent?.given) {
+      return res.status(400).json(errorResponse('Consent required', 'User consent is required for bank verification'));
+    }
+
+    // Basic validation
+    if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) {
+      return res.status(400).json(errorResponse('Invalid IFSC format', 'IFSC must be 11 characters (e.g., YESB0000262)'));
+    }
+
+    logger.info('🔄 Verifying Bank Account', { 
+      userId, 
+      maskedAccount: 'XXXX' + accountNumber.slice(-4),
+      ifsc 
+    });
+
+    // Get verification provider
+    const provider = getVerificationProvider(process.env);
+    
+    // Call provider to verify bank account
+    const result = await provider.verifyBankAccount(accountNumber, ifsc, accountHolderName);
+
+    // Create verification record
+    const now = new Date();
+    const verification = await Verification.create({
+      userId,
+      type: 'bank_account',
+      status: result.success ? 'verified' : 'failed',
+      provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+      maskedBankAccount: result.data?.maskedBankAccount || ('XXXX' + accountNumber.slice(-4)),
+      verifiedData: { 
+        accountHolderName: result.data?.accountHolderName || accountHolderName,
+        ifsc: ifsc,
+        bankName: result.data?.bankName,
+        branch: result.data?.branch,
+        status: result.data?.status
+      },
+      consent: {
+        given: true,
+        givenAt: now,
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        consentVersion: consent.version || 'v1.0',
+        consentText: consent.text || 'User consented to bank account verification'
+      },
+      auditLog: [{
+        action: 'verified',
+        performedBy: userId,
+        performedAt: now,
+        ipAddress: getClientIp(req),
+        metadata: {
+          provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+          environment: process.env.CASHFREE_ENV || 'sandbox'
+        }
+      }],
+      verifiedAt: result.success ? now : null,
+      failedAt: result.success ? null : now,
+      failureReason: result.success ? null : result.message,
+      metadata: {
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        environment: process.env.CASHFREE_ENV || 'sandbox'
+      }
+    });
+
+    logger.info('✅ Bank account verification completed', { 
+      userId, 
+      verificationId: verification._id,
+      status: verification.status 
+    });
+
+    res.json(successResponse({
+      verificationId: verification._id,
+      maskedBankAccount: verification.maskedBankAccount,
+      verifiedData: {
+        accountHolderName: verification.verifiedData?.accountHolderName,
+        bankName: verification.verifiedData?.bankName,
+        ifsc: verification.verifiedData?.ifsc
+      },
+      status: verification.status
+    }, 'Bank account verified successfully'));
+
+  } catch (error) {
+    logger.error('❌ Bank verification error', { 
+      userId: req.headers['x-user-id'],
+      error: error.message,
+      stack: error.stack
+    });
+    
+    res.status(500).json(errorResponse(
+      error.message || 'Failed to verify bank account',
+      'An error occurred while verifying bank account'
+    ));
+  }
+});
+
+/**
+ * POST /api/v1/verification/face/match
+ * Face matching verification
+ */
+router.post('/face/match', serviceAuthMiddleware, async (req, res) => {
+  if (!FEATURES.FACE) {
+    return res.status(503).json({
+      success: false,
+      message: 'Face verification is not yet available. Contact admin to enable this feature.',
+      code: 'FEATURE_NOT_ENABLED',
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // ✅ FACE MATCH VERIFICATION - ACTIVE (Mock implementation for testing)
+  try {
+    const userId = req.headers['x-user-id'] || req.body.userId;
+    const { selfieImage, documentImage, consent } = req.body;
+
+    if (!userId) {
+      return res.status(400).json(errorResponse('Missing required field: userId', 'User ID is required'));
+    }
+
+    if (!selfieImage || !documentImage) {
+      return res.status(400).json(errorResponse('Missing required fields', 'Selfie and document images are required'));
+    }
+
+    if (!consent?.given) {
+      return res.status(400).json(errorResponse('Consent required', 'User consent is required for face verification'));
+    }
+
+    logger.info('🔄 Performing Face Match', { userId });
+
+    // Get verification provider
+    const provider = getVerificationProvider(process.env);
+    
+    // Call provider to verify face match
+    const result = await provider.verifyFaceMatch(selfieImage, documentImage);
+
+    // Create verification record
+    const now = new Date();
+    const verification = await Verification.create({
+      userId,
+      type: 'face_match',
+      status: result.success ? 'verified' : 'failed',
+      provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+      faceVerification: {
+        matchScore: result.data?.matchScore || 0,
+        threshold: result.data?.threshold || 0.7,
+        matched: result.success
+      },
+      verifiedData: { 
+        matchScore: result.data?.matchScore,
+        confidence: result.data?.confidence,
+        status: result.success ? 'MATCHED' : 'NOT_MATCHED'
+      },
+      consent: {
+        given: true,
+        givenAt: now,
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        consentVersion: consent.version || 'v1.0',
+        consentText: consent.text || 'User consented to face verification'
+      },
+      auditLog: [{
+        action: 'face_match_verified',
+        performedBy: userId,
+        performedAt: now,
+        ipAddress: getClientIp(req),
+        metadata: {
+          provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+          environment: process.env.CASHFREE_ENV || 'sandbox'
+        }
+      }],
+      verifiedAt: result.success ? now : null,
+      failedAt: result.success ? null : now,
+      failureReason: result.success ? null : result.message,
+      metadata: {
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        environment: process.env.CASHFREE_ENV || 'sandbox'
+      }
+    });
+
+    logger.info('✅ Face match verification completed', { 
+      userId, 
+      verificationId: verification._id,
+      status: verification.status,
+      matchScore: result.data?.matchScore
+    });
+
+    res.json(successResponse({
+      verificationId: verification._id,
+      matchScore: result.data?.matchScore,
+      confidence: result.data?.confidence,
+      status: verification.status
+    }, 'Face match verification completed'));
+
+  } catch (error) {
+    logger.error('❌ Face match verification error', { 
+      userId: req.headers['x-user-id'],
+      error: error.message,
+      stack: error.stack
+    });
+    
+    res.status(500).json(errorResponse(
+      error.message || 'Failed to verify face match',
+      'An error occurred while verifying face match'
+    ));
+  }
+});
+
+/**
+ * POST /api/v1/verification/face/liveness
+ * Liveness detection
+ */
+router.post('/face/liveness', serviceAuthMiddleware, async (req, res) => {
+  if (!FEATURES.LIVENESS) {
+    return res.status(503).json({
+      success: false,
+      message: 'Liveness detection is not yet available. Contact admin to enable this feature.',
+      code: 'FEATURE_NOT_ENABLED',
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // ✅ LIVENESS DETECTION - ACTIVE (Mock implementation for testing)
+  try {
+    const userId = req.headers['x-user-id'] || req.body.userId;
+    const { videoData, verificationId, consent } = req.body;
+
+    if (!userId) {
+      return res.status(400).json(errorResponse('Missing required field: userId', 'User ID is required'));
+    }
+
+    if (!videoData && !verificationId) {
+      return res.status(400).json(errorResponse('Missing required fields', 'Video data or verification ID is required'));
+    }
+
+    if (!consent?.given) {
+      return res.status(400).json(errorResponse('Consent required', 'User consent is required for liveness detection'));
+    }
+
+    logger.info('🔄 Performing Liveness Detection', { userId });
+
+    // Get verification provider
+    const provider = getVerificationProvider(process.env);
+    
+    // Call provider to verify liveness
+    const result = await provider.verifyLiveness(videoData || verificationId);
+
+    // Create verification record
+    const now = new Date();
+    const verification = await Verification.create({
+      userId,
+      type: 'liveness',
+      status: result.success ? 'verified' : 'failed',
+      provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+      verifiedData: { 
+        isLive: result.success,
+        confidence: result.data?.confidence,
+        status: result.success ? 'REAL_FACE_DETECTED' : 'REAL_FACE_NOT_DETECTED'
+      },
+      consent: {
+        given: true,
+        givenAt: now,
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        consentVersion: consent.version || 'v1.0',
+        consentText: consent.text || 'User consented to liveness detection'
+      },
+      auditLog: [{
+        action: 'liveness_verified',
+        performedBy: userId,
+        performedAt: now,
+        ipAddress: getClientIp(req),
+        metadata: {
+          provider: process.env.VERIFICATION_PROVIDER || 'cashfree',
+          environment: process.env.CASHFREE_ENV || 'sandbox'
+        }
+      }],
+      verifiedAt: result.success ? now : null,
+      failedAt: result.success ? null : now,
+      failureReason: result.success ? null : result.message,
+      metadata: {
+        ipAddress: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        environment: process.env.CASHFREE_ENV || 'sandbox'
+      }
+    });
+
+    logger.info('✅ Liveness detection completed', { 
+      userId, 
+      verificationId: verification._id,
+      status: verification.status,
+      isLive: result.success
+    });
+
+    res.json(successResponse({
+      verificationId: verification._id,
+      isLive: result.success,
+      confidence: result.data?.confidence,
+      status: verification.status
+    }, 'Liveness detection completed'));
+
+  } catch (error) {
+    logger.error('❌ Liveness detection error', { 
+      userId: req.headers['x-user-id'],
+      error: error.message,
+      stack: error.stack
+    });
+    
+    res.status(500).json(errorResponse(
+      error.message || 'Failed to perform liveness detection',
+      'An error occurred while performing liveness detection'
     ));
   }
 });

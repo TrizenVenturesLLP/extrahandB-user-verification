@@ -40,9 +40,18 @@ function successResponse(data = null, message = null) {
 
 /**
  * Create error response
+ * @param {string} error - Error message
+ * @param {string} message - User-friendly message
+ * @param {string} code - Error code (optional)
  */
-function errorResponse(error, message = null) {
-  return createResponse(false, null, message, error);
+function errorResponse(error, message = null, code = null) {
+  const response = createResponse(false, null, message, error);
+  
+  if (code) {
+    response.code = code;
+  }
+  
+  return response;
 }
 
 /**

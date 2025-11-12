@@ -20,6 +20,17 @@ This service handles:
 - ✅ Rate limiting and security
 - ✅ MongoDB integration with fallback
 
+### Production-Ready Features (v1.1.0)
+
+- ✅ **OTP Expiration**: OTPs expire after 10 minutes for security
+- ✅ **Retry Logic**: Automatic retries with exponential backoff for transient failures
+- ✅ **Resend OTP**: Dedicated endpoint for resending OTPs with cooldown protection
+- ✅ **Per-User Rate Limiting**: Prevent abuse with user-specific rate limits
+- ✅ **Enhanced Error Categorization**: Clear error codes and user-friendly messages
+- ✅ **Cooldown Periods**: 60-second cooldown between OTP resends
+
+See [PRODUCTION_READY_FEATURES.md](./PRODUCTION_READY_FEATURES.md) for detailed documentation.
+
 ## Prerequisites
 
 - Node.js >= 18
