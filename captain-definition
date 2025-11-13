@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 2,
+  "dockerfilePath": "./Dockerfile",
+  "buildArguments": {
+    "NODE_ENV": "production",
+    "PORT": "4004",
+    "LOG_LEVEL": "info",
+    "RATE_LIMIT_WINDOW_MS": "900000",
+    "RATE_LIMIT_MAX_REQUESTS": "100",
+    "CORS_ORIGIN": "https://extrahand.in,https://www.extrahand.in,http://localhost:4000,http://localhost:4004",
+    "MONGODB_URI": "YOUR_MONGODB_URI_HERE",
+    "SERVICE_AUTH_TOKEN": "YOUR_SERVICE_AUTH_TOKEN_HERE",
+    "VERIFICATION_PROVIDER": "cashfree",
+    "CASHFREE_ENV": "sandbox",
+    "CASHFREE_CLIENT_ID": "YOUR_CASHFREE_CLIENT_ID",
+    "CASHFREE_CLIENT_SECRET": "YOUR_CASHFREE_CLIENT_SECRET",
+    "CASHFREE_TEST_OTP": "111000",
+    "MAIN_BACKEND_URL": "https://api.extrahand.in",
+    "FEATURE_AADHAAR": "true",
+    "FEATURE_PAN": "false",
+    "FEATURE_BANK": "false",
+    "FEATURE_FACE": "false",
+    "FEATURE_LIVENESS": "false"
+  },
+  "expose": {
+    "api": {
+      "containerPort": 4004,
+      "httpPort": 80,
+      "httpsPort": 443
+    }
+  },
+  "healthcheck": {
+    "path": "/health",
+    "port": 4004,
+    "interval": 30,
+    "timeout": 10,
+    "retries": 3,
+    "startPeriod": 30
+  },
+  "notify": {
+    "webhook": "",
+    "slack": "",
+    "discord": ""
+  },
+  "customDomain": "",
+  "forceSsl": true,
+  "appName": "extrahand-user-verification",
+  "hasPersistentData": false,
+  "description": "ExtraHand User Verification Service - Aadhaar KYC via Cashfree API",
+  "instanceCount": 1,
+  "tags": ["nodejs", "express", "mongodb", "verification", "kyc", "aadhaar", "cashfree", "extrahand"],
+  "envVars": {
+    "NODE_ENV": "production"
+  },
+  "volumes": [
+    {
+      "name": "app-logs",
+      "path": "/app/logs"
+    }
+  ],
+  "restart": {
+    "policy": "unless-stopped",
+    "maximumRetryCount": 10
+  },
+  "resources": {
+    "memory": "512Mi",
+    "cpu": "0.5"
+  },
+  "networking": {
+    "publishAllPorts": false,
+    "enableTcpProxy": false
+  }
+}
+
