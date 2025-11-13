@@ -16,20 +16,29 @@ RUN addgroup -g 1001 -S nodejs && \
 # Dependencies stage
 FROM base AS dependencies
 
-# Copy package files
-COPY package*.json ./
+# Copy package files explicitly (package-lock.json is optional with *)
+COPY package.json package-lock.json* ./
 
 # Install production dependencies only
-RUN npm ci --only=production && npm cache clean --force
+# Use --omit=dev instead of deprecated --only=production
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev && npm cache clean --force; \
+    else \
+      npm install --omit=dev && npm cache clean --force; \
+    fi
 
 # Build stage
 FROM base AS build
 
-# Copy package files
-COPY package*.json ./
+# Copy package files explicitly (package-lock.json is optional with *)
+COPY package.json package-lock.json* ./
 
 # Install all dependencies (including dev dependencies)
-RUN npm ci
+RUN if [ -f package-lock.json ]; then \
+      npm ci; \
+    else \
+      npm install; \
+    fi
 
 # Copy source code
 COPY . .
