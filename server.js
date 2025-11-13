@@ -16,15 +16,21 @@ let isShuttingDown = false;
 
 async function start() {
   try {
-    // Connect to MongoDB if configured
+    // Connect to MongoDB if configured (non-blocking - server will start even if MongoDB fails)
     if (env.MONGODB_URI) {
-      await connectMongo(env.MONGODB_URI);
-      logger.info('✅ Connected to MongoDB');
+      try {
+        await connectMongo(env.MONGODB_URI);
+        logger.info('✅ Connected to MongoDB');
+      } catch (error) {
+        logger.error('❌ MongoDB connection failed, but continuing to start server:', error.message);
+        logger.warn('⚠️ Server will run in degraded mode without MongoDB. Some features may be unavailable.');
+        // Don't throw - allow server to start in degraded mode
+      }
     } else {
       logger.warn('⚠️ MONGODB_URI not set; running without MongoDB (in-memory fallback)');
     }
 
-    // Start HTTP server
+    // Start HTTP server (always start, even if MongoDB failed)
     server = app.listen(PORT, () => {
       logger.info(`🚀 ExtraHand User Verification Service listening on port ${PORT}`);
       logger.info(`Environment: ${env.NODE_ENV}`);
